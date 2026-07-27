@@ -126,6 +126,84 @@ impl Checker {
             }
         }
     }
+
+    pub async fn suggest_safe_version(
+        &mut self,
+        ecosystem: &Ecosystem,
+        package: &str,
+    ) -> Result<CheckResult> {
+        let metadata = match ecosystem {
+            Ecosystem::Npm => {
+                if self.npm_registry.is_none() {
+                    self.npm_registry = Some(NpmRegistry::new());
+                }
+                self.npm_registry.as_ref().unwrap().resolve(package).await?
+            }
+            Ecosystem::Go => {
+                if self.go_registry.is_none() {
+                    self.go_registry = Some(GoRegistry::new());
+                }
+                self.go_registry.as_ref().unwrap().resolve(package).await?
+            }
+        };
+
+        for version in metadata.versions.iter().rev().take(50) {
+            let result = self.check(ecosystem, package, version).await?;
+            if result.recommendation == Recommendation::Allow {
+                return Ok(result);
+            }
+        }
+
+        let mut result = self.check(ecosystem, package, "latest").await?;
+        result.summary = format!(
+            "No safe version found for {} {}. Latest version has {} vulnerabilities.",
+            ecosystem, package, result.vulnerability_count
+        );
+        Ok(result)
+    }
+
+    pub async fn compare_versions(
+        &mut self,
+        ecosystem: &Ecosystem,
+        package: &str,
+        from_version: &str,
+        to_version: &str,
+    ) -> Result<CompareResult> {
+        let from_result = self.check(ecosystem, package, from_version).await?;
+        let to_result = self.check(ecosystem, package, to_version).await?;
+
+        let risk_improved = to_result.risk_score < from_result.risk_score;
+
+        let from_ids: std::collections::HashSet<&str> =
+            from_result.vulnerabilities.iter().map(|v| v.id.as_str()).collect();
+        let to_ids: std::collections::HashSet<&str> =
+            to_result.vulnerabilities.iter().map(|v| v.id.as_str()).collect();
+
+        let resolved: Vec<String> = from_ids.difference(&to_ids).map(|id| id.to_string()).collect();
+        let added: Vec<String> = to_ids.difference(&from_ids).map(|id| id.to_string()).collect();
+
+        let next_action = if risk_improved {
+            "upgrade_to_target".to_string()
+        } else if to_result.risk_score == from_result.risk_score {
+            "no_change".to_string()
+        } else {
+            "downgrade_riskier".to_string()
+        };
+
+        Ok(CompareResult {
+            ecosystem: ecosystem.to_string(),
+            package: package.to_string(),
+            from_version: from_version.to_string(),
+            to_version: to_version.to_string(),
+            from_risk_score: from_result.risk_score,
+            to_risk_score: to_result.risk_score,
+            risk_improved,
+            recommendation: to_result.recommendation,
+            next_action,
+            resolved_vulnerabilities: resolved,
+            added_vulnerabilities: added,
+        })
+    }
 }
 
 fn calculate_risk_score(vulns: &[Vulnerability]) -> u8 {
